@@ -8,9 +8,7 @@ import (
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
 	"time"
-	"bytes"
-	"encoding/gob"
-	"errors"
+	"./utils"
 )
 
 var firstRun bool
@@ -34,54 +32,6 @@ type AuditRow struct {
 	Modified  string `db:"modified"`
 }
 
-func getTimeStamp() string {
-	// Seconds end at 19th character, ignore the rest
-	return fmt.Sprintf("%.19s", time.Now().UTC())
-}
-
-func getNull() sql.NullString {
-	return sql.NullString{String: "", Valid: false}
-}
-
-func getNullString(s string) sql.NullString {
-	return sql.NullString{String: s, Valid: true}
-}
-
-// TODO Read the discussion about MapScan at link below
-// https://github.com/jmoiron/sqlx/issues/135
-func MapBytesToString(m map[string]interface{}) {
-	for k, v := range m {
-		if b, ok := v.([]byte); ok {
-			m[k] = string(b)
-		}
-	}
-}
-
-func MapScan(r sqlx.ColScanner, destination map[string]interface{}) error {
-	err := sqlx.MapScan(r, destination)
-	if err != nil {
-		return err
-	}
-	MapBytesToString(destination)
-	return nil
-}
-
-// GetBytes converts an arbitrary interface to a byte array
-// http://stackoverflow.com/a/23004209/639133
-func GetBytes(key interface{}) ([]byte, error) {
-	if key == nil {
-		return nil, errors.New("Key is nil")
-	}
-
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(key)
-	if err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
 // initAudit initialises audit.db the first time `gaudit scan` is executed.
 // To reset simply delete audit.db from the filesystem.
 // It returns true if the audit table is empty
@@ -89,8 +39,6 @@ func initAudit(auditDb *sqlx.DB) (firstRun bool) {
 	schema := `
 	create table if not exists
 		row (tableName, hash, dump, modified);
-	create table if not exists
-		cell (tableName, columnName, hash, modified);
 	create table if not exists
 		meta (key, value);
 	`
@@ -179,14 +127,14 @@ meta *Meta) {
 		r := AuditRow{
 			TableName: tableName,
 			Hash:   row.Hash,
-			Dump: getNull(),
+			Dump: utils.GetNull(),
 			// Seconds end at 19th character, ignore the rest
-			Modified:  getTimeStamp(),
+			Modified:  utils.GetTimeStamp(),
 		}
 
 		if !firstRun {
 			//fmt.Println(string(row.Dump))
-			r.Dump = getNullString(string(row.Dump))
+			r.Dump = utils.GetNullString(string(row.Dump))
 		}
 
 		_, err := tx.NamedExec(insertRow, r)
@@ -228,7 +176,7 @@ func mapTableRows(auditDb *sqlx.DB, targetDb *sqlx.DB, meta *Meta) {
 
 		for rows.Next() {
 			rowData := make(map[string]interface{})
-			err = MapScan(rows, rowData)
+			err = utils.MapScan(rows, rowData)
 			if err != nil {
 				panic(err)
 			}
@@ -266,10 +214,7 @@ func main() {
 	}
 
 	firstRun = initAudit(auditDb)
-
 	mapTableRows(auditDb, targetDb, &meta)
-
 	meta.executionTime = time.Since(start)
-
 	finished(&meta)
 }
