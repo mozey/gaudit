@@ -190,7 +190,7 @@ func processRow(tableName string,
 	return ar, true
 }
 
-func tableFinished(tableName string, rowBatch []AuditRow, meta *Meta) {
+func tableFinished(tableName string, batch []AuditRow, meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
@@ -198,7 +198,7 @@ func tableFinished(tableName string, rowBatch []AuditRow, meta *Meta) {
 		values (:TableName, :RowHash, :RowDump, :Modified)`
 	tx := conns.Audit.MustBegin()
 
-	for _, ar := range rowBatch {
+	for _, ar := range batch {
 		ar.TableName = tableName
 		// Seconds end at 19th character, ignore the rest
 		ar.Modified = fmt.Sprintf("%.19s", time.Now().UTC())
@@ -236,7 +236,7 @@ func mapTableRows(meta *Meta) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		rowBatch := make([]AuditRow, 0, tableRowCount)
+		batch := make([]AuditRow, 0, tableRowCount)
 
 		query = fmt.Sprintf("select * from %s", tableName)
 		rows, err := conns.Target.Queryx(query)
@@ -252,11 +252,11 @@ func mapTableRows(meta *Meta) {
 			}
 			row, changed := processRow(tableName, rowData, rowHashes, meta)
 			if changed {
-				rowBatch = append(rowBatch, row)
+				batch = append(batch, row)
 			}
 		}
 
-		tableFinished(tableName, rowBatch, meta)
+		tableFinished(tableName, batch, meta)
 		fmt.Println(fmt.Sprintf("%s %d", tableName, meta.tableChanges))
 	}
 }
