@@ -23,11 +23,7 @@ type Meta struct {
 	executionTime   time.Duration
 }
 
-type RowData struct {
-	Dump []byte
-	Hash string
-}
-
+// Auditing
 type AuditRow struct {
 	TableName  string         `db:"TableName"`
 	PrimaryKey string         `db:"RowHash"`
@@ -35,14 +31,14 @@ type AuditRow struct {
 	RowDump    sql.NullString `db:"RowDump"`
 	Modified   string         `db:"Modified"`
 }
-
 type RowMap map[string]AuditRow
 
-type ConfigAudit struct {
+// Config
+type AuditConfig struct {
 	Type             string `json:"type"`
 	ConnectionString string `json:"connectionString"`
 }
-type ConfigTarget struct {
+type TargetConfig struct {
 	Type             string `json:"type"`
 	ConnectionString string `json:"connectionString"`
 	Tables           []struct {
@@ -51,8 +47,8 @@ type ConfigTarget struct {
 	} `json:"tables"`
 }
 type Config struct {
-	Audit  ConfigAudit  `json:"audit"`
-	Target ConfigTarget `json:"target"`
+	Audit  AuditConfig  `json:"audit"`
+	Target TargetConfig `json:"target"`
 }
 // config.json must exist at the same path as audit
 func (c *Config) load() {
@@ -68,16 +64,17 @@ func (c *Config) load() {
 
 // Set default values for config
 var config = Config{
-	Audit: ConfigAudit{
+	Audit: AuditConfig{
 		Type:             "sqlite3",
 		ConnectionString: "./audit.db",
 	},
-	Target: ConfigTarget{
+	Target: TargetConfig{
 		Type:             "sqlite3",
 		ConnectionString: "./Chinook_Sqlite.sqlite",
 	},
 }
 
+// Connections
 type Connections struct {
 	Audit *sqlx.DB
 	Target *sqlx.DB
@@ -174,25 +171,26 @@ func tableStart(tableName string, rowHashes map[string]bool,
 
 func processRow(tableName string,
 	rowData map[string]interface{},
-	rowHashes map[string]bool, meta *Meta) (row RowData, changed bool) {
+	rowHashes map[string]bool,
+	meta *Meta) (ar AuditRow, changed bool) {
 
 	meta.rowsProcessed += 1
 
-	row = RowData{}
-	row.Dump, _ = json.Marshal(rowData)
-	row.Hash = fmt.Sprintf("%x", md5.Sum([]byte(row.Dump)))
+	rowDump, _ := json.Marshal(rowData)
+	ar.RowDump = sql.NullString{String: string(rowDump), Valid: true}
+	ar.RowHash = fmt.Sprintf("%x", md5.Sum(rowDump))
 
-	if rowHashes[row.Hash] {
-		delete(rowHashes, row.Hash)
-		return row, false
+	if rowHashes[ar.RowHash] {
+		delete(rowHashes, ar.RowHash)
+		return ar, false
 	}
 
 	meta.databaseChanges += 1
 	meta.tableChanges += 1
-	return row, true
+	return ar, true
 }
 
-func tableFinished(tableName string, rowBatch []RowData, meta *Meta) {
+func tableFinished(tableName string, rowBatch []AuditRow, meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
@@ -200,21 +198,16 @@ func tableFinished(tableName string, rowBatch []RowData, meta *Meta) {
 		values (:TableName, :RowHash, :RowDump, :Modified)`
 	tx := conns.Audit.MustBegin()
 
-	for _, row := range rowBatch {
-		r := AuditRow{
-			TableName: tableName,
-			RowHash:   row.Hash,
-			RowDump:   utils.GetNull(),
-			// Seconds end at 19th character, ignore the rest
-			Modified: utils.GetTimeStamp(),
+	for _, ar := range rowBatch {
+		ar.TableName = tableName
+		// Seconds end at 19th character, ignore the rest
+		ar.Modified = fmt.Sprintf("%.19s", time.Now().UTC())
+
+		if firstRun {
+			ar.RowDump = sql.NullString{String: "", Valid: false}
 		}
 
-		if !firstRun {
-			//fmt.Println(string(row.Dump))
-			r.RowDump = utils.GetNullString(string(row.Dump))
-		}
-
-		_, err := tx.NamedExec(insertRow, r)
+		_, err := tx.NamedExec(insertRow, ar)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -243,7 +236,7 @@ func mapTableRows(meta *Meta) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		rowBatch := make([]RowData, 0, tableRowCount)
+		rowBatch := make([]AuditRow, 0, tableRowCount)
 
 		query = fmt.Sprintf("select * from %s", tableName)
 		rows, err := conns.Target.Queryx(query)
@@ -264,7 +257,6 @@ func mapTableRows(meta *Meta) {
 		}
 
 		tableFinished(tableName, rowBatch, meta)
-		rowBatch = []RowData{}
 		fmt.Println(fmt.Sprintf("%s %d", tableName, meta.tableChanges))
 	}
 }

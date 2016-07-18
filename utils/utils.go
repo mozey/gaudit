@@ -4,25 +4,9 @@ import (
 	"github.com/jmoiron/sqlx"
 	"bytes"
 	"encoding/gob"
-	"fmt"
-	"time"
-	"database/sql"
 	"errors"
 	"encoding/json"
 )
-
-func GetTimeStamp() string {
-	// Seconds end at 19th character, ignore the rest
-	return fmt.Sprintf("%.19s", time.Now().UTC())
-}
-
-func GetNull() sql.NullString {
-	return sql.NullString{String: "", Valid: false}
-}
-
-func GetNullString(s string) sql.NullString {
-	return sql.NullString{String: s, Valid: true}
-}
 
 // TODO Read the discussion about MapScan at link below
 // https://github.com/jmoiron/sqlx/issues/135
