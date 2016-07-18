@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"time"
+	"sort"
 )
 
 var firstRun bool
@@ -28,7 +29,7 @@ type Meta struct {
 
 type AuditRow struct {
 	TableName  string         `db:"TableName"`
-	PrimaryKey string         `db:"RowHash"`
+	PrimaryKey sql.NullString `db:"PrimaryKey"`
 	RowHash    string         `db:"RowHash"`
 	RowDump    sql.NullString `db:"RowDump"`
 	Modified   string         `db:"Modified"`
@@ -41,6 +42,9 @@ type HistoryRow struct {
 }
 
 type RowMap map[string]AuditRow
+
+var rowMap RowMap
+
 
 // Config
 
@@ -161,29 +165,28 @@ func getTables() (tableNames []string) {
 	return tableNames
 }
 
-func tableStart(tableName string, rowHashes map[string]bool,
-	meta *Meta) {
+func tableStart(tableName string, meta *Meta) {
 	params := map[string]interface{}{"tableName": tableName}
 	rows, err := conns.Audit.NamedQuery(
-		"select RowHash from audit where tableName = :tableName",
+		"select PrimaryKey, RowHash from audit where tableName = :tableName",
 		params)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for rows.Next() {
-		var rowHash string
-		err = rows.Scan(&rowHash)
+		ar := AuditRow{}
+		err = rows.StructScan(&ar)
 		if err != nil {
 			log.Fatal(err)
 		}
-		rowHashes[rowHash] = true
+
+		// TODO Use PrimaryKey index if specified
+		rowMap[ar.RowHash] = ar
 	}
 }
 
-func processRow(tableName string,
-	rowData map[string]interface{},
-	rowHashes map[string]bool,
+func processRow(tableName string, rowData map[string]interface{},
 	meta *Meta) (ar AuditRow, changed bool) {
 
 	meta.rowsProcessed += 1
@@ -192,8 +195,9 @@ func processRow(tableName string,
 	ar.RowDump = sql.NullString{String: string(rowDump), Valid: true}
 	ar.RowHash = fmt.Sprintf("%x", md5.Sum(rowDump))
 
-	if rowHashes[ar.RowHash] {
-		delete(rowHashes, ar.RowHash)
+	// Have we seen this hash before?
+	if _, ok := rowMap[ar.RowHash]; ok {
+		delete(rowMap, ar.RowHash)
 		return ar, false
 	}
 
@@ -232,12 +236,12 @@ func mapTableRows(meta *Meta) {
 	tableNames := getTables()
 
 	for _, tableName := range tableNames {
-		rowHashes := make(map[string]bool)
+		rowMap = make(RowMap)
 		if meta.tableChanges == nil {
 			meta.tableChanges = make(map[string]int)
 		}
 		meta.tableChanges[tableName] = 0
-		tableStart(tableName, rowHashes, meta)
+		tableStart(tableName, meta)
 
 		var tableRowCount int
 		query := fmt.Sprintf("select count(*) from %s", tableName)
@@ -259,9 +263,9 @@ func mapTableRows(meta *Meta) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			row, changed := processRow(tableName, rowData, rowHashes, meta)
+			ar, changed := processRow(tableName, rowData, meta)
 			if changed {
-				batch = append(batch, row)
+				batch = append(batch, ar)
 			}
 		}
 
@@ -299,12 +303,20 @@ func finished(meta *Meta, history int) {
 	if history > 0 {
 		// Seconds end at 19th character, ignore the rest
 		ExecutionTimestamp := fmt.Sprintf("%.19s", time.Now().UTC())
-		for tableName, v := range meta.tableChanges {
+
+		var keys []string
+		for k, _ := range meta.tableChanges {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, tableName := range keys {
+			v := meta.tableChanges[tableName]
 			insertHistoryRow(
 				ExecutionTimestamp,
 				fmt.Sprintf("Table %s", tableName),
 				fmt.Sprintf("%d", v))
 		}
+
 		insertHistoryRow(ExecutionTimestamp,
 			databaseChanges, fmt.Sprintf("%d", meta.databaseChanges))
 		insertHistoryRow(ExecutionTimestamp,
