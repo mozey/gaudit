@@ -1,6 +1,6 @@
 # gaudit
 
-Golang tool for extracting information from unfamiliar databases
+Golang tool for auditing databases
 
 
 ## Quickstart

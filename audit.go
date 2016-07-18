@@ -15,8 +15,6 @@ import (
 )
 
 var firstRun bool
-var auditDb *sqlx.DB
-var targetDb *sqlx.DB
 
 type Meta struct {
 	rowsProcessed   int64
@@ -105,7 +103,7 @@ var conns = Connections{}
 
 // initAudit initialises audit.db the first time `gaudit -a` is executed.
 // To reset run "delete from audit" or delete audit.db.
-func initAudit(auditDb *sqlx.DB) (firstRun bool) {
+func initAudit() (firstRun bool) {
 	// Create audit.db tables if not exists
 	schema := `
 	create table if not exists
@@ -113,11 +111,11 @@ func initAudit(auditDb *sqlx.DB) (firstRun bool) {
 	create table if not exists
 		history (Id, ExecutionTimestamp, Key, Value);
 	`
-	auditDb.Exec(schema)
+	conns.Audit.Exec(schema)
 
 	// Return true if the audit table is empty
 	var auditCount int
-	err := auditDb.Get(&auditCount,
+	err := conns.Audit.Get(&auditCount,
 		"select count(*) from audit")
 	if err != nil {
 		log.Fatal(err)
@@ -125,10 +123,10 @@ func initAudit(auditDb *sqlx.DB) (firstRun bool) {
 	return auditCount == 0
 }
 
-func getTables(targetDb *sqlx.DB) (tableNames []string) {
+func getTables() (tableNames []string) {
 	query :=
 		`select name from sqlite_master where type='table'`
-	rows, err := targetDb.Query(query)
+	rows, err := conns.Target.Query(query)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -145,10 +143,10 @@ func getTables(targetDb *sqlx.DB) (tableNames []string) {
 	return
 }
 
-func tableStart(auditDb *sqlx.DB, tableName string, rowHashes map[string]bool,
+func tableStart(tableName string, rowHashes map[string]bool,
 	meta *Meta) {
 	params := map[string]interface{}{"tableName": tableName}
-	rows, err := auditDb.NamedQuery(
+	rows, err := conns.Audit.NamedQuery(
 		"select RowHash from audit where tableName = :tableName",
 		params)
 	if err != nil {
@@ -165,7 +163,7 @@ func tableStart(auditDb *sqlx.DB, tableName string, rowHashes map[string]bool,
 	}
 }
 
-func processRow(auditDb *sqlx.DB, tableName string,
+func processRow(tableName string,
 	rowData map[string]interface{},
 	rowHashes map[string]bool, meta *Meta) (row HashRow, changed bool) {
 
@@ -185,14 +183,13 @@ func processRow(auditDb *sqlx.DB, tableName string,
 	return row, true
 }
 
-func tableFinished(auditDb *sqlx.DB, tableName string, rowBatch []HashRow,
-	meta *Meta) {
+func tableFinished(tableName string, rowBatch []HashRow, meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
 		(TableName, RowHash, RowDump, Modified)
 		values (:TableName, :RowHash, :RowDump, :Modified)`
-	tx := auditDb.MustBegin()
+	tx := conns.Audit.MustBegin()
 
 	for _, row := range rowBatch {
 		r := AuditRow{
@@ -223,24 +220,24 @@ func finished(meta *Meta) {
 	fmt.Println(fmt.Sprintf("Execution time %s", meta.executionTime))
 }
 
-func mapTableRows(auditDb *sqlx.DB, targetDb *sqlx.DB, meta *Meta) {
-	tableNames := getTables(targetDb)
+func mapTableRows(meta *Meta) {
+	tableNames := getTables()
 
 	for _, tableName := range tableNames {
 		rowHashes := make(map[string]bool)
 		meta.tableChanges = 0
-		tableStart(auditDb, tableName, rowHashes, meta)
+		tableStart(tableName, rowHashes, meta)
 
 		var tableRowCount int
 		query := fmt.Sprintf("select count(*) from %s", tableName)
-		err := targetDb.Get(&tableRowCount, query)
+		err := conns.Target.Get(&tableRowCount, query)
 		if err != nil {
 			log.Fatal(err)
 		}
 		rowBatch := make([]HashRow, 0, tableRowCount)
 
 		query = fmt.Sprintf("select * from %s", tableName)
-		rows, err := targetDb.Queryx(query)
+		rows, err := conns.Target.Queryx(query)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -251,14 +248,13 @@ func mapTableRows(auditDb *sqlx.DB, targetDb *sqlx.DB, meta *Meta) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			row, changed := processRow(
-				auditDb, tableName, rowData, rowHashes, meta)
+			row, changed := processRow(tableName, rowData, rowHashes, meta)
 			if changed {
 				rowBatch = append(rowBatch, row)
 			}
 		}
 
-		tableFinished(auditDb, tableName, rowBatch, meta)
+		tableFinished(tableName, rowBatch, meta)
 		rowBatch = []HashRow{}
 		fmt.Println(fmt.Sprintf("%s %d", tableName, meta.tableChanges))
 	}
@@ -281,7 +277,7 @@ func main() {
 		conns.connect()
 		defer conns.close()
 
-		fmt.Println(getTables(targetDb))
+		fmt.Println(getTables())
 
 	} else if *runAudit {
 		conns.connect()
@@ -290,8 +286,8 @@ func main() {
 		start := time.Now()
 		meta := Meta{}
 
-		firstRun = initAudit(auditDb)
-		mapTableRows(auditDb, targetDb, &meta)
+		firstRun = initAudit()
+		mapTableRows(&meta)
 		meta.executionTime = time.Since(start)
 		finished(&meta)
 
