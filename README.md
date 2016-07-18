@@ -61,7 +61,7 @@ To override this use the config file
         "target": {
             "tables": [
                 {
-                    "name": "Genre",
+                    "tableName": "Genre",
                 }
             ]
         }
@@ -74,8 +74,8 @@ tables in the config file
 
     "tables": [
         {
-            "name": "Genre",
-            "primaryKey": ["GenreId"]
+            "tableName": "Genre",
+            "keyColumns": ["GenreId"]
         }
     ]
 

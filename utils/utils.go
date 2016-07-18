@@ -78,4 +78,3 @@ func JsonDump(i interface{}, indent bool) string {
 	s, _ := json.MarshalIndent(i, "", indentString)
 	return string(s)
 }
-

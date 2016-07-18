@@ -11,8 +11,9 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"log"
 	"os"
-	"time"
 	"sort"
+	"time"
+	"strings"
 )
 
 var firstRun bool
@@ -42,9 +43,15 @@ type HistoryRow struct {
 }
 
 type RowMap map[string]AuditRow
+type TableMapItem struct {
+	TargetTable
+	// Primary key columns separated by PrimaryKeySeparator
+	PrimaryKey string
+}
+type TableMap map[string]TableMapItem
 
 var rowMap RowMap
-
+var tableMap TableMap
 
 // Config
 
@@ -52,21 +59,24 @@ type AuditConfig struct {
 	Type             string `json:"type"`
 	ConnectionString string `json:"connectionString"`
 }
+type TargetTable struct {
+	TableName  string   `json:"tableName"`
+	KeyColumns []string `json:"keyColumns"`
+}
 type TargetConfig struct {
-	Type             string `json:"type"`
-	ConnectionString string `json:"connectionString"`
-	Tables           []struct {
-		Name       string   `json:"name"`
-		PrimaryKey []string `json:"primaryKey"`
-	} `json:"tables"`
+	Type             string        `json:"type"`
+	ConnectionString string        `json:"connectionString"`
+	Tables           []TargetTable `json:"tables"`
 }
 type Config struct {
-	Audit  AuditConfig  `json:"audit"`
-	Target TargetConfig `json:"target"`
+	KeySeparator string       `json:"keySeparator"`
+	Audit        AuditConfig  `json:"audit"`
+	Target       TargetConfig `json:"target"`
 }
 
 // config.json must exist at the same path as audit
 func (c *Config) load() {
+	// Override default config
 	file, err := os.Open("./config.json")
 	if err == nil {
 		decoder := json.NewDecoder(file)
@@ -75,10 +85,20 @@ func (c *Config) load() {
 			log.Fatal(err)
 		}
 	}
+
+	// Initialise tableMap
+	tableMap = make(TableMap)
+	for _, v := range config.Target.Tables {
+		tmi := new(TableMapItem)
+		tmi.TableName = v.TableName
+		tmi.KeyColumns = v.KeyColumns
+		tableMap[v.TableName] = *tmi
+	}
 }
 
 // Set default values for config
 var config = Config{
+	KeySeparator: "|",
 	Audit: AuditConfig{
 		Type:             "sqlite3",
 		ConnectionString: "./audit.db",
@@ -141,7 +161,7 @@ func initAudit() (firstRun bool) {
 func getTables() (tableNames []string) {
 	if config.Target.Tables != nil {
 		for _, v := range config.Target.Tables {
-			tableNames = append(tableNames, v.Name)
+			tableNames = append(tableNames, v.TableName)
 		}
 
 	} else {
@@ -167,9 +187,10 @@ func getTables() (tableNames []string) {
 
 func tableStart(tableName string, meta *Meta) {
 	params := map[string]interface{}{"tableName": tableName}
-	rows, err := conns.Audit.NamedQuery(
-		"select PrimaryKey, RowHash from audit where tableName = :tableName",
-		params)
+	rows, err := conns.Audit.NamedQuery(`
+	select TableName, PrimaryKey, RowHash, RowDump, Modified
+	from audit where TableName = :tableName
+	`, params)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -181,26 +202,67 @@ func tableStart(tableName string, meta *Meta) {
 			log.Fatal(err)
 		}
 
-		// TODO Use PrimaryKey index if specified
-		rowMap[ar.RowHash] = ar
+		// A primary key was constructed for this row
+		// in a previous audit run
+		if ar.PrimaryKey.Valid {
+			rowMap[ar.PrimaryKey.String] = ar
+		} else {
+			// rowMap is keyed on the row hash by default
+			rowMap[ar.RowHash] = ar
+		}
 	}
 }
 
 func processRow(tableName string, rowData map[string]interface{},
 	meta *Meta) (ar AuditRow, changed bool) {
-
+	// TODO Wrap in closure and defer?
+	// One more row processed
 	meta.rowsProcessed += 1
 
+	// Construct primary key if key columns configured for this tableName
+	var tmi TableMapItem
+	var ok bool
+	hasPrimaryKey := false
+	if tmi, ok = tableMap[tableName]; ok {
+		primaryKey := make([]string, len(tmi.KeyColumns))
+		for i, keyColumn := range(tmi.KeyColumns) {
+			primaryKey[i] = fmt.Sprintf("%v", rowData[keyColumn])
+		}
+		tmi.PrimaryKey = strings.Join(primaryKey, config.KeySeparator)
+		if tmi.PrimaryKey == "" {
+			log.Fatal("Empty primary key for table", tableName)
+		}
+		hasPrimaryKey = true
+	}
+
+	// Create row dump
+	ar.TableName = tableName
 	rowDump, _ := json.Marshal(rowData)
 	ar.RowDump = sql.NullString{String: string(rowDump), Valid: true}
 	ar.RowHash = fmt.Sprintf("%x", md5.Sum(rowDump))
 
-	// Have we seen this hash before?
-	if _, ok := rowMap[ar.RowHash]; ok {
-		delete(rowMap, ar.RowHash)
-		return ar, false
+	// This table has key columns.
+	// Compare hash for a specific target row
+	if hasPrimaryKey {
+		ar.PrimaryKey = sql.NullString{String: tmi.PrimaryKey, Valid: true}
+		if _, ok = rowMap[ar.PrimaryKey.String]; ok {
+			if rowMap[ar.PrimaryKey.String].RowHash == ar.RowHash {
+				// The row hash has not changed
+				delete(rowMap, ar.RowHash)
+				return ar, false
+			}
+		}
+
+	} else {
+		// No key columns.
+		// Have we seen this hash for any row in the table?
+		if _, ok = rowMap[ar.RowHash]; ok {
+			delete(rowMap, ar.RowHash)
+			return ar, false
+		}
 	}
 
+	// This row has been changed
 	meta.databaseChanges += 1
 	meta.tableChanges[tableName] += 1
 	return ar, true
@@ -210,12 +272,11 @@ func tableFinished(tableName string, batch []AuditRow, meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
-		(TableName, RowHash, RowDump, Modified)
-		values (:TableName, :RowHash, :RowDump, :Modified)`
+		(TableName, PrimaryKey, RowHash, RowDump, Modified)
+		values (:TableName, :PrimaryKey, :RowHash, :RowDump, :Modified)`
 	tx := conns.Audit.MustBegin()
 
 	for _, ar := range batch {
-		ar.TableName = tableName
 		// Seconds end at 19th character, ignore the rest
 		ar.Modified = fmt.Sprintf("%.19s", time.Now().UTC())
 
@@ -352,6 +413,7 @@ func main() {
 		conns.connect()
 		defer conns.close()
 		fmt.Println(getTables())
+		fmt.Println(utils.JsonDump(tableMap, true))
 
 	} else if *runAudit {
 		start := time.Now()
