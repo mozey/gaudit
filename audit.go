@@ -1,17 +1,22 @@
 package main
 
 import (
+	"./utils"
 	"crypto/md5"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
+	"log"
+	"os"
 	"time"
-	"./utils"
 )
 
 var firstRun bool
+var auditDb *sqlx.DB
+var targetDb *sqlx.DB
 
 type Meta struct {
 	rowsProcessed   int64
@@ -26,47 +31,113 @@ type HashRow struct {
 }
 
 type AuditRow struct {
-	TableName string `db:"tableName"`
-	Hash      string `db:"hash"`
-	Dump      sql.NullString `db:"dump"`
-	Modified  string `db:"modified"`
+	TableName  string         `db:"TableName"`
+	PrimaryKey string         `db:"RowHash"`
+	RowHash    string         `db:"RowHash"`
+	RowDump    sql.NullString `db:"RowDump"`
+	Modified   string         `db:"Modified"`
 }
 
-// initAudit initialises audit.db the first time `gaudit scan` is executed.
-// To reset simply delete audit.db from the filesystem.
-// It returns true if the audit table is empty
+type ConfigAudit struct {
+	Type             string `json:"type"`
+	ConnectionString string `json:"connectionString"`
+}
+type ConfigTarget struct {
+	Type             string `json:"type"`
+	ConnectionString string `json:"connectionString"`
+	Tables           []struct {
+		Name       string   `json:"name"`
+		PrimaryKey []string `json:"primaryKey"`
+	} `json:"tables"`
+}
+type Config struct {
+	Audit  ConfigAudit  `json:"audit"`
+	Target ConfigTarget `json:"target"`
+}
+// config.json must exist at the same path as audit
+func (c *Config) load() {
+	file, err := os.Open("./config.json")
+	if err == nil {
+		decoder := json.NewDecoder(file)
+		err = decoder.Decode(&config)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+// Set default values for config
+var config = Config{
+	Audit: ConfigAudit{
+		Type:             "sqlite3",
+		ConnectionString: "./audit.db",
+	},
+	Target: ConfigTarget{
+		Type:             "sqlite3",
+		ConnectionString: "./Chinook_Sqlite.sqlite",
+	},
+}
+
+type Connections struct {
+	Audit *sqlx.DB
+	Target *sqlx.DB
+}
+func (c *Connections) connect() {
+	var err error
+
+	c.Audit, err = sqlx.Open(config.Audit.Type, config.Audit.ConnectionString)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	c.Target, err = sqlx.Connect(
+		config.Target.Type, config.Target.ConnectionString)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func (c *Connections) close() {
+	c.Audit.Close()
+	c.Target.Close()
+}
+
+var conns = Connections{}
+
+// initAudit initialises audit.db the first time `gaudit -a` is executed.
+// To reset run "delete from audit" or delete audit.db.
 func initAudit(auditDb *sqlx.DB) (firstRun bool) {
+	// Create audit.db tables if not exists
 	schema := `
 	create table if not exists
-		row (tableName, hash, dump, modified);
+		audit (TableName, PrimaryKey, RowHash, RowDump, Modified);
 	create table if not exists
-		meta (key, value);
+		history (Id, ExecutionTimestamp, Key, Value);
 	`
 	auditDb.Exec(schema)
 
-	var rowCount int
-	err := auditDb.Get(&rowCount,
-		"select count(*) from row")
+	// Return true if the audit table is empty
+	var auditCount int
+	err := auditDb.Get(&auditCount,
+		"select count(*) from audit")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	return rowCount == 0
+	return auditCount == 0
 }
 
-func getTables(auditDb *sqlx.DB) (tableNames []string) {
+func getTables(targetDb *sqlx.DB) (tableNames []string) {
 	query :=
-	`select name from sqlite_master where type='table'`
-	//`select name from sqlite_master where type='table' and name like 'G%'`
-	rows, err := auditDb.Query(query)
+		`select name from sqlite_master where type='table'`
+	rows, err := targetDb.Query(query)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	for rows.Next() {
 		var name sql.NullString
 		err = rows.Scan(&name)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		tableNames = append(tableNames, name.String)
 	}
@@ -75,28 +146,28 @@ func getTables(auditDb *sqlx.DB) (tableNames []string) {
 }
 
 func tableStart(auditDb *sqlx.DB, tableName string, rowHashes map[string]bool,
-meta *Meta) {
+	meta *Meta) {
 	params := map[string]interface{}{"tableName": tableName}
 	rows, err := auditDb.NamedQuery(
-		"select hash from row where tableName = :tableName",
+		"select RowHash from audit where tableName = :tableName",
 		params)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	for rows.Next() {
 		var rowHash string
 		err = rows.Scan(&rowHash)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		rowHashes[rowHash] = true
 	}
 }
 
 func processRow(auditDb *sqlx.DB, tableName string,
-rowData map[string]interface{},
-rowHashes map[string]bool, meta *Meta) (row HashRow, changed bool) {
+	rowData map[string]interface{},
+	rowHashes map[string]bool, meta *Meta) (row HashRow, changed bool) {
 
 	meta.rowsProcessed += 1
 
@@ -115,31 +186,31 @@ rowHashes map[string]bool, meta *Meta) (row HashRow, changed bool) {
 }
 
 func tableFinished(auditDb *sqlx.DB, tableName string, rowBatch []HashRow,
-meta *Meta) {
+	meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
-	insertRow := `insert into row
-		(tableName, hash, dump, modified)
-		values (:tableName, :hash, :dump, :modified)`
+	insertRow := `insert into audit
+		(TableName, RowHash, RowDump, Modified)
+		values (:TableName, :RowHash, :RowDump, :Modified)`
 	tx := auditDb.MustBegin()
 
 	for _, row := range rowBatch {
 		r := AuditRow{
 			TableName: tableName,
-			Hash:   row.Hash,
-			Dump: utils.GetNull(),
+			RowHash:   row.Hash,
+			RowDump:   utils.GetNull(),
 			// Seconds end at 19th character, ignore the rest
-			Modified:  utils.GetTimeStamp(),
+			Modified: utils.GetTimeStamp(),
 		}
 
 		if !firstRun {
 			//fmt.Println(string(row.Dump))
-			r.Dump = utils.GetNullString(string(row.Dump))
+			r.RowDump = utils.GetNullString(string(row.Dump))
 		}
 
 		_, err := tx.NamedExec(insertRow, r)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 	}
 
@@ -164,21 +235,21 @@ func mapTableRows(auditDb *sqlx.DB, targetDb *sqlx.DB, meta *Meta) {
 		query := fmt.Sprintf("select count(*) from %s", tableName)
 		err := targetDb.Get(&tableRowCount, query)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		rowBatch := make([]HashRow, 0, tableRowCount)
 
 		query = fmt.Sprintf("select * from %s", tableName)
 		rows, err := targetDb.Queryx(query)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 
 		for rows.Next() {
 			rowData := make(map[string]interface{})
 			err = utils.MapScan(rows, rowData)
 			if err != nil {
-				panic(err)
+				log.Fatal(err)
 			}
 			row, changed := processRow(
 				auditDb, tableName, rowData, rowHashes, meta)
@@ -193,28 +264,43 @@ func mapTableRows(auditDb *sqlx.DB, targetDb *sqlx.DB, meta *Meta) {
 	}
 }
 
-func main() {
-	start := time.Now()
-	meta := Meta{}
-
-	var auditDb *sqlx.DB
-	var targetDb *sqlx.DB
-	var err error
-
-	auditDb, err = sqlx.Open("sqlite3", "./audit.db")
-	defer auditDb.Close()
-	if err != nil {
-		panic(err)
-	}
-
-	targetDb, err = sqlx.Connect("sqlite3", "./Chinook_Sqlite.sqlite")
-	defer targetDb.Close()
-	if err != nil {
-		panic(err)
-	}
-
-	firstRun = initAudit(auditDb)
-	mapTableRows(auditDb, targetDb, &meta)
-	meta.executionTime = time.Since(start)
-	finished(&meta)
+func init() {
+	// https://golang.org/pkg/log/#pkg-constants
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
+
+func main() {
+	listTables := flag.Bool("l", false, "List tables")
+	runAudit := flag.Bool("a", false, "Audit")
+	printConfig := flag.Bool("c", false, "Print config")
+	flag.Parse()
+
+	config.load()
+
+	if *listTables {
+		conns.connect()
+		defer conns.close()
+
+		fmt.Println(getTables(targetDb))
+
+	} else if *runAudit {
+		conns.connect()
+		defer conns.close()
+
+		start := time.Now()
+		meta := Meta{}
+
+		firstRun = initAudit(auditDb)
+		mapTableRows(auditDb, targetDb, &meta)
+		meta.executionTime = time.Since(start)
+		finished(&meta)
+
+	} else if *printConfig {
+		fmt.Println(utils.JsonDump(config, true))
+
+	} else {
+		flag.Usage()
+	}
+}
+
+
