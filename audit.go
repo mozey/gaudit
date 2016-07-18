@@ -23,7 +23,7 @@ type Meta struct {
 	executionTime   time.Duration
 }
 
-type HashRow struct {
+type RowData struct {
 	Dump []byte
 	Hash string
 }
@@ -35,6 +35,8 @@ type AuditRow struct {
 	RowDump    sql.NullString `db:"RowDump"`
 	Modified   string         `db:"Modified"`
 }
+
+type RowMap map[string]AuditRow
 
 type ConfigAudit struct {
 	Type             string `json:"type"`
@@ -124,23 +126,30 @@ func initAudit() (firstRun bool) {
 }
 
 func getTables() (tableNames []string) {
-	query :=
-		`select name from sqlite_master where type='table'`
-	rows, err := conns.Target.Query(query)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if config.Target.Tables != nil {
+		for _, v := range config.Target.Tables {
+			tableNames = append(tableNames, v.Name)
+		}
 
-	for rows.Next() {
-		var name sql.NullString
-		err = rows.Scan(&name)
+	} else {
+		query :=
+			`select name from sqlite_master where type='table'`
+		rows, err := conns.Target.Query(query)
 		if err != nil {
 			log.Fatal(err)
 		}
-		tableNames = append(tableNames, name.String)
+
+		for rows.Next() {
+			var name sql.NullString
+			err = rows.Scan(&name)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tableNames = append(tableNames, name.String)
+		}
 	}
 
-	return
+	return tableNames
 }
 
 func tableStart(tableName string, rowHashes map[string]bool,
@@ -165,11 +174,11 @@ func tableStart(tableName string, rowHashes map[string]bool,
 
 func processRow(tableName string,
 	rowData map[string]interface{},
-	rowHashes map[string]bool, meta *Meta) (row HashRow, changed bool) {
+	rowHashes map[string]bool, meta *Meta) (row RowData, changed bool) {
 
 	meta.rowsProcessed += 1
 
-	row = HashRow{}
+	row = RowData{}
 	row.Dump, _ = json.Marshal(rowData)
 	row.Hash = fmt.Sprintf("%x", md5.Sum([]byte(row.Dump)))
 
@@ -183,7 +192,7 @@ func processRow(tableName string,
 	return row, true
 }
 
-func tableFinished(tableName string, rowBatch []HashRow, meta *Meta) {
+func tableFinished(tableName string, rowBatch []RowData, meta *Meta) {
 	// TODO Bulk insert?
 	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
@@ -234,7 +243,7 @@ func mapTableRows(meta *Meta) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		rowBatch := make([]HashRow, 0, tableRowCount)
+		rowBatch := make([]RowData, 0, tableRowCount)
 
 		query = fmt.Sprintf("select * from %s", tableName)
 		rows, err := conns.Target.Queryx(query)
@@ -255,7 +264,7 @@ func mapTableRows(meta *Meta) {
 		}
 
 		tableFinished(tableName, rowBatch, meta)
-		rowBatch = []HashRow{}
+		rowBatch = []RowData{}
 		fmt.Println(fmt.Sprintf("%s %d", tableName, meta.tableChanges))
 	}
 }
