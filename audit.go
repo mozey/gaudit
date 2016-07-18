@@ -15,15 +15,17 @@ import (
 )
 
 var firstRun bool
+var verbose bool = false
 
 type Meta struct {
-	rowsProcessed   int64
-	databaseChanges int64
-	tableChanges    int64
+	rowsProcessed   int
+	databaseChanges int
+	tableChanges    map[string]int
 	executionTime   time.Duration
 }
 
-// Auditing
+// Audit database
+
 type AuditRow struct {
 	TableName  string         `db:"TableName"`
 	PrimaryKey string         `db:"RowHash"`
@@ -31,9 +33,17 @@ type AuditRow struct {
 	RowDump    sql.NullString `db:"RowDump"`
 	Modified   string         `db:"Modified"`
 }
+
+type HistoryRow struct {
+	ExecutionTimestamp string `db:"ExecutionTimestamp"`
+	Key                string `db:"Key"`
+	Value              string `db:"Value"`
+}
+
 type RowMap map[string]AuditRow
 
 // Config
+
 type AuditConfig struct {
 	Type             string `json:"type"`
 	ConnectionString string `json:"connectionString"`
@@ -50,6 +60,7 @@ type Config struct {
 	Audit  AuditConfig  `json:"audit"`
 	Target TargetConfig `json:"target"`
 }
+
 // config.json must exist at the same path as audit
 func (c *Config) load() {
 	file, err := os.Open("./config.json")
@@ -76,9 +87,10 @@ var config = Config{
 
 // Connections
 type Connections struct {
-	Audit *sqlx.DB
+	Audit  *sqlx.DB
 	Target *sqlx.DB
 }
+
 func (c *Connections) connect() {
 	var err error
 
@@ -108,7 +120,7 @@ func initAudit() (firstRun bool) {
 	create table if not exists
 		audit (TableName, PrimaryKey, RowHash, RowDump, Modified);
 	create table if not exists
-		history (Id, ExecutionTimestamp, Key, Value);
+		history (ExecutionTimestamp, Key, Value);
 	`
 	conns.Audit.Exec(schema)
 
@@ -186,7 +198,7 @@ func processRow(tableName string,
 	}
 
 	meta.databaseChanges += 1
-	meta.tableChanges += 1
+	meta.tableChanges[tableName] += 1
 	return ar, true
 }
 
@@ -216,18 +228,15 @@ func tableFinished(tableName string, batch []AuditRow, meta *Meta) {
 	tx.Commit()
 }
 
-func finished(meta *Meta) {
-	fmt.Println(fmt.Sprintf("Database changes %d", meta.databaseChanges))
-	fmt.Println(fmt.Sprintf("Rows processed %d", meta.rowsProcessed))
-	fmt.Println(fmt.Sprintf("Execution time %s", meta.executionTime))
-}
-
 func mapTableRows(meta *Meta) {
 	tableNames := getTables()
 
 	for _, tableName := range tableNames {
 		rowHashes := make(map[string]bool)
-		meta.tableChanges = 0
+		if meta.tableChanges == nil {
+			meta.tableChanges = make(map[string]int)
+		}
+		meta.tableChanges[tableName] = 0
 		tableStart(tableName, rowHashes, meta)
 
 		var tableRowCount int
@@ -257,7 +266,58 @@ func mapTableRows(meta *Meta) {
 		}
 
 		tableFinished(tableName, batch, meta)
-		fmt.Println(fmt.Sprintf("%s %d", tableName, meta.tableChanges))
+		if verbose {
+			log.Println(fmt.Sprintf(
+				"%s %d", tableName, meta.tableChanges[tableName]))
+		}
+	}
+}
+
+func insertHistoryRow(ExecutionTimestamp string, key string, value string) {
+	hr := HistoryRow{
+		ExecutionTimestamp: ExecutionTimestamp,
+		Key:                key,
+		Value:              value,
+	}
+	insertRow := `insert into history
+		(ExecutionTimestamp, Key, Value)
+		values (:ExecutionTimestamp, :Key, :Value)`
+	_, err := conns.Audit.NamedExec(insertRow, hr)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func finished(meta *Meta, history int) {
+	databaseChanges := "Database changes"
+	rowsProcessed := "Rows processed"
+	executionTime := "Execution time"
+
+	// TODO Clear history for old audit runs
+
+	// Save history for this audit run
+	if history > 0 {
+		// Seconds end at 19th character, ignore the rest
+		ExecutionTimestamp := fmt.Sprintf("%.19s", time.Now().UTC())
+		for tableName, v := range meta.tableChanges {
+			insertHistoryRow(
+				ExecutionTimestamp,
+				fmt.Sprintf("Table %s", tableName),
+				fmt.Sprintf("%d", v))
+		}
+		insertHistoryRow(ExecutionTimestamp,
+			databaseChanges, fmt.Sprintf("%d", meta.databaseChanges))
+		insertHistoryRow(ExecutionTimestamp,
+			rowsProcessed, fmt.Sprintf("%d", meta.rowsProcessed))
+		insertHistoryRow(ExecutionTimestamp,
+			executionTime, fmt.Sprintf("%s", meta.executionTime))
+	}
+
+	// Print results
+	if verbose {
+		log.Println(fmt.Sprintf("%s %d", databaseChanges, meta.databaseChanges))
+		log.Println(fmt.Sprintf("%s %d", rowsProcessed, meta.rowsProcessed))
+		log.Println(fmt.Sprintf("%s %s", executionTime, meta.executionTime))
 	}
 }
 
@@ -270,6 +330,8 @@ func main() {
 	listTables := flag.Bool("l", false, "List tables")
 	runAudit := flag.Bool("a", false, "Audit")
 	printConfig := flag.Bool("c", false, "Print config")
+	history := flag.Int("h", 0, "Save history")
+	flag.BoolVar(&verbose, "v", false, "Print results of audit run")
 	flag.Parse()
 
 	config.load()
@@ -277,20 +339,17 @@ func main() {
 	if *listTables {
 		conns.connect()
 		defer conns.close()
-
 		fmt.Println(getTables())
 
 	} else if *runAudit {
+		start := time.Now()
 		conns.connect()
 		defer conns.close()
-
-		start := time.Now()
 		meta := Meta{}
-
 		firstRun = initAudit()
 		mapTableRows(&meta)
 		meta.executionTime = time.Since(start)
-		finished(&meta)
+		finished(&meta, *history)
 
 	} else if *printConfig {
 		fmt.Println(utils.JsonDump(config, true))
@@ -299,5 +358,3 @@ func main() {
 		flag.Usage()
 	}
 }
-
-

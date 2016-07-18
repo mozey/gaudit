@@ -55,7 +55,7 @@ Create a file `config.json` at the same path as `audit.go`, for example
 ## Specifying table names and primary keys
 
 By default all the target database tables are audited.
-To override this use the config file:
+To override this use the config file
 
     {
         "target": {
@@ -69,18 +69,15 @@ To override this use the config file:
 
 
 Without primary keys, reverting a row to a state since the last snapshot will 
-not be picked up by the audit. To specify primary keys use the config file
+not be picked up by the audit. To specify primary keys add it to the list of 
+tables in the config file
 
-    {
-        "target": {
-            "tables": [
-                {
-                    "name": "Genre",
-                    "primaryKey": ["GenreId"]
-                }
-            ]
+    "tables": [
+        {
+            "name": "Genre",
+            "primaryKey": ["GenreId"]
         }
-    }
+    ]
 
 
 
