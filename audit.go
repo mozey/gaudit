@@ -215,7 +215,6 @@ func tableStart(tableName string, meta *Meta) {
 
 func processRow(tableName string, rowData map[string]interface{},
 	meta *Meta) (ar AuditRow, changed bool) {
-	// TODO Wrap in closure and defer?
 	// One more row processed
 	meta.rowsProcessed += 1
 
@@ -269,8 +268,6 @@ func processRow(tableName string, rowData map[string]interface{},
 }
 
 func tableFinished(tableName string, batch []AuditRow, meta *Meta) {
-	// TODO Bulk insert?
-	// https://github.com/jmoiron/sqlx/issues/134
 	insertRow := `insert into audit
 		(TableName, PrimaryKey, RowHash, RowDump, Modified)
 		values (:TableName, :PrimaryKey, :RowHash, :RowDump, :Modified)`
@@ -357,8 +354,6 @@ func finished(meta *Meta, history int) {
 	databaseChanges := "Database changes"
 	rowsProcessed := "Rows processed"
 	executionTime := "Execution time"
-
-	// TODO Clear history for old audit runs
 
 	// Save history for this audit run
 	if history > 0 {
