@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/go-sql-driver/mysql"
 	"log"
 	"os"
 	"sort"
@@ -80,7 +81,7 @@ func (c *Config) load() {
 	file, err := os.Open("./config.json")
 	if err == nil {
 		decoder := json.NewDecoder(file)
-		err = decoder.Decode(&config)
+		err = decoder.Decode(&c)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -165,8 +166,13 @@ func getTables() (tableNames []string) {
 		}
 
 	} else {
-		query :=
-			`select name from sqlite_master where type='table'`
+		var query string
+		switch config.Target.Type {
+		case "mysql":
+			query = `show tables`
+		default:
+			query = `select name from sqlite_master where type='table'`
+		}
 		rows, err := conns.Target.Query(query)
 		if err != nil {
 			log.Fatal(err)
@@ -408,7 +414,6 @@ func main() {
 		conns.connect()
 		defer conns.close()
 		fmt.Println(getTables())
-		fmt.Println(utils.JsonDump(tableMap, true))
 
 	} else if *runAudit {
 		start := time.Now()
